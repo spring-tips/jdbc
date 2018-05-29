@@ -7,7 +7,6 @@ create table customers (
   email varchar(255)              null
 );
 
-
 create table orders (
   id          bigint(10) auto_increment not null primary key,
   sku         varchar(255)              not null,
