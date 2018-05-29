@@ -12,69 +12,40 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.event.EventListener;
 import org.springframework.core.annotation.Order;
 import org.springframework.data.annotation.Id;
-import org.springframework.data.jdbc.mapping.event.BeforeSaveEvent;
 import org.springframework.data.jdbc.mapping.model.NamingStrategy;
 import org.springframework.data.jdbc.repository.config.EnableJdbcRepositories;
+import org.springframework.data.jdbc.repository.query.Query;
 import org.springframework.data.repository.CrudRepository;
+import org.springframework.data.repository.query.Param;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.core.PreparedStatementCreator;
 import org.springframework.jdbc.core.ResultSetExtractor;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.SqlParameter;
 import org.springframework.jdbc.core.simple.SimpleJdbcInsert;
-import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.jdbc.object.MappingSqlQuery;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.stereotype.Repository;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionStatus;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionCallbackWithoutResult;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.sql.DataSource;
 import java.sql.*;
 import java.util.*;
-import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 @SpringBootApplication
 public class JdbcApplication {
-
-		@Bean
-		PlatformTransactionManager dataSourceTransactionManager(DataSource dataSource) {
-				return new DataSourceTransactionManager(dataSource);
-		}
-
-		@Bean
-		TransactionTemplate transactionTemplate(PlatformTransactionManager transactionManager) {
-				return new TransactionTemplate(transactionManager);
-		}
-
-		@Bean
-		JdbcTemplate jdbcTemplate(DataSource dataSource) {
-				return new JdbcTemplate(dataSource);
-		}
 
 		public static void main(String[] args) {
 				SpringApplication.run(JdbcApplication.class, args);
 		}
 }
 
-@Log4j2
-abstract class StringUtils {
-
-		public static void line() {
-				log.info("====================================");
-		}
-}
-
-@Log4j2
 @Order(1)
 @Component
+@Log4j2
 class QueryCustomersAndOrdersCount implements ApplicationRunner {
 
 		private final JdbcTemplate jdbcTemplate;
@@ -85,14 +56,12 @@ class QueryCustomersAndOrdersCount implements ApplicationRunner {
 
 		@Override
 		public void run(ApplicationArguments args) throws Exception {
-
 				StringUtils.line();
-
-				List<CustomerOrderReport> customerOrderReports = this.jdbcTemplate
-					.query(" select c.*, (select count(o.id) from orders o where o.customer_fk = c.id ) as count from customers c ",
-						(rs, rowNum) -> new CustomerOrderReport(rs.getLong("id"), rs.getString("email"), rs.getString("name"), rs.getInt("count")));
-				customerOrderReports.forEach(log::info);
-
+				Collection<CustomerOrderReport> reports =
+					this.jdbcTemplate
+						.query("select c.*, (  select count(o.id) from orders o where o.customer_fk = c.id  ) as count  from customers c ",
+							(rs, rowNum) -> new CustomerOrderReport(rs.getLong("id"), rs.getString("name"), rs.getString("email"), rs.getInt("count")));
+				reports.forEach(log::info);
 		}
 
 		@Data
@@ -100,16 +69,32 @@ class QueryCustomersAndOrdersCount implements ApplicationRunner {
 		@NoArgsConstructor
 		public static class CustomerOrderReport {
 				private Long customerId;
-				private String email, name;
+				private String name, email;
 				private int orderCount;
 		}
 }
 
-
-@Log4j2
 @Order(2)
+@Log4j2
 @Component
 class QueryCustomersAndOrders implements ApplicationRunner {
+
+		@Data
+		@AllArgsConstructor
+		@NoArgsConstructor
+		public static class Customer {
+				private Long id;
+				private String name, email;
+				private Set<Order> orders = new HashSet<>();
+		}
+
+		@Data
+		@AllArgsConstructor
+		@NoArgsConstructor
+		public static class Order {
+				private Long id;
+				private String sku;
+		}
 
 		private final JdbcTemplate jdbcTemplate;
 
@@ -122,51 +107,46 @@ class QueryCustomersAndOrders implements ApplicationRunner {
 
 				StringUtils.line();
 
-				ResultSetExtractor<Collection<Customer>> customerResultSetExtractor = rs -> {
+				ResultSetExtractor<Collection<Customer>> rse = rs -> {
 						Map<Long, Customer> customerMap = new HashMap<>();
 						Customer currentCustomer = null;
-						Function<ResultSet, Customer> customerMapper = input -> {
-								try {
-										return new Customer(input.getLong("cid"), input.getString("email"), input.getString("name"), new HashSet<>());
-								}
-								catch (Exception e) {
-										throw new RuntimeException(e);
-								}
-						};
-
-						Function<ResultSet, Order> orderMapper = input -> {
-								try {
-										return new Order(rs.getLong("oid"), rs.getString("sku"));
-								}
-								catch (SQLException e) {
-										throw new RuntimeException(e);
-								}
-						};
-
 						while (rs.next()) {
 								long id = rs.getLong("cid");
 
 								if (currentCustomer == null || currentCustomer.getId() != id) {
-										currentCustomer = customerMapper.apply(rs);
+										currentCustomer = new Customer(rs.getLong("cid"), rs.getString("name"), rs.getString("email"), new HashSet<>());
 								}
-
-								currentCustomer.getOrders().add(orderMapper.apply(rs));
+								String customerFk = rs.getString("customer_fk");
+								if (customerFk != null) {
+										String sku = rs.getString("sku");
+										Long oid = rs.getLong("oid");
+										Order order = new Order(oid, sku);
+										currentCustomer.getOrders().add(order);
+								}
 								customerMap.put(currentCustomer.getId(), currentCustomer);
 						}
 
 						return customerMap.values();
 				};
 
-				Collection<Customer> customers = this.jdbcTemplate.query("select c.id as cid, c.*, o.id as oid, o.* from customers c left join orders o on c.id = o.customer_fk order by cid", customerResultSetExtractor);
+				Collection<Customer> customers = this.jdbcTemplate
+					.query("select c.id as cid,  c.*, o.id as oid,  o.* from customers c left join orders o on c.id = o.customer_fk order by cid ", rse);
 				customers.forEach(log::info);
 		}
+}
+
+
+@Order(3)
+@Log4j2
+@Component
+class QueryCustomersAndOrdersSimpleFlatMapper implements ApplicationRunner {
 
 		@Data
 		@AllArgsConstructor
 		@NoArgsConstructor
 		public static class Customer {
 				private Long id;
-				private String email, name;
+				private String name, email;
 				private Set<Order> orders = new HashSet<>();
 		}
 
@@ -177,14 +157,6 @@ class QueryCustomersAndOrders implements ApplicationRunner {
 				private Long id;
 				private String sku;
 		}
-
-}
-
-
-@Log4j2
-@Order(3)
-@Component
-class QueryCustomersAndOrdersSimpleFlatMapper implements ApplicationRunner {
 
 		private final JdbcTemplate jdbcTemplate;
 
@@ -197,119 +169,108 @@ class QueryCustomersAndOrdersSimpleFlatMapper implements ApplicationRunner {
 
 				StringUtils.line();
 
-				ResultSetExtractorImpl<Customer> customerResultSetExtractor =
+				ResultSetExtractorImpl<Customer> rse =
 					JdbcTemplateMapperFactory
 						.newInstance()
 						.addKeys("id")
 						.newResultSetExtractor(Customer.class);
 
-				Collection<Customer> customers = this.jdbcTemplate.query("select c.id as  id, c.name as name, c.email as email, o.id as orders_id , o.sku as orders_sku from customers c left join orders o on c.id = o.customer_fk", customerResultSetExtractor);
+				Collection<Customer> customers = this.jdbcTemplate
+					.query("select c.id as id,  c.name as name, c.email as email, o.id as orders_id, o.sku as orders_sku from customers c left outer  join orders o on o.customer_fk = c.id  order by c.id  ", rse);
+
+				customers = customers
+					.stream()
+					.map(c -> {
+							boolean hasNullOrderValues = c.getOrders().stream().anyMatch(o -> o.getId() == null);
+							if (hasNullOrderValues) {
+									c.setOrders(new HashSet<>());
+							}
+							return c;
+					})
+					.collect(Collectors.toSet());
+
 				customers.forEach(log::info);
 		}
+}
+
+@Configuration
+@Order(4)
+@Log4j2
+class JdbcTemplateWriter implements ApplicationRunner {
+
+		private final JdbcTemplate jdbcTemplate;
+		private final RowMapper<Customer> customerRowMapper = (rs, rowNum) -> new Customer(rs.getLong("id"), rs.getString("name"), rs.getString("email"));
+
+
+		JdbcTemplateWriter(JdbcTemplate jdbcTemplate) {
+				this.jdbcTemplate = jdbcTemplate;
+		}
 
 		@Data
 		@AllArgsConstructor
 		@NoArgsConstructor
 		public static class Customer {
 				private Long id;
-				private String email, name;
-				private Set<Order> orders = new HashSet<>();
+				private String name, email;
+
 		}
 
-		@Data
-		@AllArgsConstructor
-		@NoArgsConstructor
-		public static class Order {
-				private Long id;
-				private String sku;
-		}
-}
+		public Customer insert(String name, String email) {
 
-@Log4j2
-@Order(4)
-@Configuration
-class JdbcTemplateCustomerServiceWriter implements ApplicationRunner {
+				GeneratedKeyHolder generatedKeyHolder = new GeneratedKeyHolder();
 
+				this.jdbcTemplate.update(con -> {
+						PreparedStatement preparedStatement = con.prepareStatement("insert into customers( name, email) values (?, ?)", Statement.RETURN_GENERATED_KEYS);
+						preparedStatement.setString(1, name);
+						preparedStatement.setString(2, email);
+						return preparedStatement;
+				}, generatedKeyHolder);
 
-		JdbcTemplateCustomerServiceWriter(TransactionTemplate transactionTemplate, JdbcTemplateCustomerService customerService) {
-				this.transactionTemplate = transactionTemplate;
-				this.customerService = customerService;
-		}
+				long idOfNewCustomer = generatedKeyHolder.getKey().longValue();
 
-		@Service
-		@Transactional
-		public static class JdbcTemplateCustomerService {
-
-				private final JdbcTemplate jdbcTemplate;
-
-				public JdbcTemplateCustomerService(JdbcTemplate jdbcTemplate) {
-						this.jdbcTemplate = jdbcTemplate;
-				}
-
-				public Customer insert(String name, String email) {
-						GeneratedKeyHolder keyHolder = new GeneratedKeyHolder();
-						PreparedStatementCreator psc = con -> {
-								PreparedStatement ps = con.prepareStatement("insert into customers(name,email) values( ?, ?)", Statement.RETURN_GENERATED_KEYS);
-								ps.setString(1, name);
-								ps.setString(2, email);
-								return ps;
-						};
-						this.jdbcTemplate.update(psc, keyHolder);
-						Long id = keyHolder.getKey().longValue();
-						return byId(id);
-				}
-
-				public Customer byId(Long id) {
-						return jdbcTemplate.queryForObject("select * from customers c where c.id = ? ",
-							(rs, rowNum) -> new Customer(rs.getLong("id"), rs.getString("email"), rs.getString("name")), id);
-				}
-
-				public Collection<Customer> all() {
-						return jdbcTemplate.query("select * from customers c",
-							(rs, rowNum) -> new Customer(rs.getLong("id"), rs.getString("email"), rs.getString("name")));
-				}
+				return jdbcTemplate.queryForObject("select c.* from customers c where c.id = ? ", customerRowMapper, idOfNewCustomer);
 		}
 
 		@Override
 		public void run(ApplicationArguments args) throws Exception {
 				StringUtils.line();
-				try {
-
-						transactionTemplate.execute(new TransactionCallbackWithoutResult() {
-								@Override
-								protected void doInTransactionWithoutResult(TransactionStatus transactionStatus) {
-										Stream.of("A", "B", "C").forEach(name -> customerService.insert(name, name + "@" + name + ".com"));
-//										throw new RuntimeException("monkey wrench!");
-								}
-						});
-				}
-				catch (RuntimeException e) {
-						log.error(e);
-				}
-				customerService.all().forEach(c -> log.info(customerService.byId(c.getId())));
-		}
-
-		private final TransactionTemplate transactionTemplate;
-		private final JdbcTemplateCustomerService customerService;
-
-		@Data
-		@AllArgsConstructor
-		@NoArgsConstructor
-		public static class Customer {
-				private Long id;
-				private String email, name;
+				Stream.of("A", "B", "C").forEach(name -> insert(name, name + '@' + name + ".com"));
+				log.info("RESULTS");
+				this.jdbcTemplate.query("select * from customers order by id ", customerRowMapper).forEach(log::info);
 		}
 }
 
+
+@Configuration
 @Order(5)
 @Log4j2
-@Configuration
-class SimpleJdbcCustomerServiceWriter implements ApplicationRunner {
+class JdbcObjectWriter implements ApplicationRunner {
 
-		private final SimpleCustomerService customerService;
+		private final SimpleJdbcInsert simpleJdbcInsert;
+		private final CustomerMappingSqlQuery all, byId;
 
-		SimpleJdbcCustomerServiceWriter(SimpleCustomerService customerService) {
-				this.customerService = customerService;
+		JdbcObjectWriter(DataSource ds) {
+				this.simpleJdbcInsert = new SimpleJdbcInsert(ds)
+					.withTableName("customers")
+					.usingGeneratedKeyColumns("id");
+
+				this.all = new CustomerMappingSqlQuery(ds, "select * from customers");
+				this.byId = new CustomerMappingSqlQuery(ds, "select * from customers where id = ?", new SqlParameter("id", Types.INTEGER));
+		}
+
+		private static class CustomerMappingSqlQuery extends MappingSqlQuery<Customer> {
+
+				public CustomerMappingSqlQuery(DataSource ds, String sql, SqlParameter... params) {
+						setDataSource(ds);
+						setSql(sql);
+						setParameters(params);
+						afterPropertiesSet();
+				}
+
+				@Override
+				protected Customer mapRow(ResultSet rs, int rowNum) throws SQLException {
+						return new Customer(rs.getLong("id"), rs.getString("name"), rs.getString("email"));
+				}
 		}
 
 		@Data
@@ -317,94 +278,69 @@ class SimpleJdbcCustomerServiceWriter implements ApplicationRunner {
 		@NoArgsConstructor
 		public static class Customer {
 				private Long id;
-				private String email, name;
+				private String name, email;
 		}
 
-		@Service
-		@Transactional
-		public static class SimpleCustomerService {
-
-				public SimpleCustomerService(DataSource ds) {
-						this.all = new CustomerMappingSqlQuery(ds, "select * from customers");
-						this.byId = new CustomerMappingSqlQuery(ds, "select * from customers where id = ? ", new SqlParameter("id", Types.INTEGER));
-
-						this.insert = new SimpleJdbcInsert(ds)
-							.usingGeneratedKeyColumns("id")
-							.withTableName("customers");
-				}
-
-				private static class CustomerMappingSqlQuery extends org.springframework.jdbc.object.MappingSqlQuery<Customer> {
-
-
-						public CustomerMappingSqlQuery(DataSource ds, String sql, SqlParameter... parameters) {
-								setDataSource(ds);
-								setSql(sql);
-
-								for (SqlParameter p : parameters)
-										declareParameter(p);
-
-								compile();
-						}
-
-						@Override
-						protected Customer mapRow(ResultSet rs, int rowNum) throws SQLException {
-								return new Customer(rs.getLong("id"), rs.getString("name"), rs.getString("email"));
-						}
-
-				}
-
-				private final CustomerMappingSqlQuery all, byId;
-				private final SimpleJdbcInsert insert;
-
-				public Customer insert(String name, String email) {
-						Map<String, Object> params = new HashMap<>();
-						params.put("name", name);
-						params.put("email", email);
-						Long newId = this.insert.executeAndReturnKey(params).longValue();
-						return byId(newId);
-				}
-
-				public Collection<Customer> all() {
-						return this.all.execute();
-				}
-
-				public Customer byId(Long id) {
-						return this.byId.findObject(id);
-				}
+		public Customer insert(String name, String email) {
+				Map<String, Object> params = new HashMap<>();
+				params.put("name", name);
+				params.put("email", email);
+				Long id = this.simpleJdbcInsert.executeAndReturnKey(params).longValue();
+				return this.byId.findObject(id);
 		}
 
 		@Override
 		public void run(ApplicationArguments args) throws Exception {
 				StringUtils.line();
-				Stream.of("A", "B", "C").forEach(name -> customerService.insert(name, name + "@" + name + ".com"));
-				customerService.all().forEach(c -> log.info(customerService.byId(c.getId())));
+				Stream.of("A", "B", "C").forEach(name -> insert(name, name + '@' + name + ".com"));
+				this.all.execute().forEach(log::info);
 		}
 }
+
 
 @Data
 @AllArgsConstructor
 @NoArgsConstructor
 class Customer {
-
 		@Id
 		private Long id;
-		private String email, name;
+		private String name, email;
 }
+
 
 @Repository
 interface CustomerRepository extends CrudRepository<Customer, Long> {
+
+		@Query("select * from customers c where c.email = :email")
+		Collection<Customer> findByEmail(@Param("email") String email);
+}
+
+@Log4j2
+@Component
+@Order(6)
+class SpringDataJdbc implements ApplicationRunner {
+
+		private final CustomerRepository customerRepository;
+
+		SpringDataJdbc(CustomerRepository customerRepository) {
+				this.customerRepository = customerRepository;
+		}
+
+		@Override
+		public void run(ApplicationArguments args) throws Exception {
+
+				StringUtils.line();
+				Stream.of("A", "B", "C").forEach(name -> customerRepository.save(new Customer(null, name, name + '@' + name + ".com")));
+				customerRepository.findAll().forEach(log::info);
+				customerRepository.save(new Customer(null, "foo", "bar"));
+				customerRepository.findByEmail("bar").forEach(log::info);
+
+		}
 }
 
 @Configuration
 @EnableJdbcRepositories
-@Log4j2
 class SpringDataJdbcConfiguration {
-
-		@EventListener(BeforeSaveEvent.class)
-		public void before(BeforeSaveEvent event) {
-				Customer customer = Customer.class.cast(event.getEntity());
-				log.info("saving .. " + customer);
-		}
 
 		@Bean
 		NamingStrategy namingStrategy() {
@@ -415,21 +351,12 @@ class SpringDataJdbcConfiguration {
 						}
 				};
 		}
+}
 
-		@Component
-		public static class SpringDataJdbc implements ApplicationRunner {
+@Log4j2
+abstract class StringUtils {
 
-				private final CustomerRepository customerRepository;
-
-				public SpringDataJdbc(CustomerRepository customerRepository) {
-						this.customerRepository = customerRepository;
-				}
-
-				@Override
-				public void run(ApplicationArguments args) throws Exception {
-						StringUtils.line();
-						Stream.of("D", "E", "F").forEach(name -> customerRepository.save(new Customer(null, name, name + "@" + name + ".com")));
-						customerRepository.findAll().forEach(c -> log.info(customerRepository.findById(c.getId()).get()));
-				}
+		public static void line() {
+				log.info("==========================================");
 		}
 }
